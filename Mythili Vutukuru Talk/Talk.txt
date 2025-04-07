@@ -1,0 +1,90 @@
+Device Driver:
+  Interaction b/w NIC and Software
+  Configure NIC via MMIO
+  NIC sends interrupt to CPU
+
+Interrupt Handling:
+  CPU receives interrupt
+  CPU saves current state
+  CPU jumps to interrupt handler
+  CPU executes interrupt handler
+  CPU restores saved state
+  CPU resumes execution
+
+N/W Interrupt Handling:
+  Ethernet Processing, IP routing, TCP reliability, congestion control, ...etc
+  TOP Half: Interrupt handler acknowledges interrupt, minimal processing, disable future interrupts (Interrupt only for the first packet)
+  BOTTOM Half: Top half schedules bottom half, bottom half traverses in the RX buffer and processes the received packets, bottom half re-enables interrupts
+
+Device Driver Rings:
+  NIC and Kernel exchange info. about packets via TX/RX rings
+  RX Ring: Circular array -> pointers rto RX packets
+
+Ksoftirqd:
+  Kernel thread that runs softirqs
+  Allocates socket buffers (sk_buff) structure of packet
+  sk_buff: Data structure that holds packet header and payload
+
+Interrupt + Softirq:= can run of multiple cores
+
+After TCP/IP processing -> packet --> Socket buffer -> Socket buffer queue -> Application (read syscall (kernel Mem -> User Mem))
+
+** Due to all these overheads the Max throughput possible is ~ 15Gbps, no matter how much threading and scaling you do 
+
+-- Need Fast I/O techniques
+
+- Kernel Bypass: User space applications can directly access NIC
+
+- In-Kernel Program Offload: Push some extra application func. into the kernel
+  
+  eBPF: extended Berkeley Packet Filter:
+
+  Code -> eBPF Verifier -> JIT Compiler -> user code runs inside eBPF Hook Points (inside Kernel) 
+  
+  Which hook to use when?
+  TC Hook invoked during TCP/IP processign
+  Socker filtering hook during socket selection
+  Each hook has diff. fields of info. about packet avai. suitable, hook chosen etc.
+
+  Kernel Bypass with AF_XDP:
+    Regular sockets (AD_INET) receive packets after TCP/IP processing
+    AD_XDP is special type of socket that can receive packet directly from XDP Hook
+    Packet DMA directly into user space, no copy to kernel space, no kernel stack processing overhead
+    Program at XDP notifies user space app. via poll/interrupt mechanisms
+    Higher throughputs
+
+  XDP is one (first point of entry) of the hook where you can write eBPF programs
+  
+  DPDK: Kernel Bypass Mechanism
+    Poll mode driver in user space, kernel driver is just passthrough
+    Polls Device, fetches and processes batches of packets
+    Packet buffers in Ueer space pre-allocated buffers, huge pages
+    Minimal Kernel Involvement
+    -> Kernel Tools don't work anymore, no kernel benefits -> TCP/IP processing, isolation, kernel tools, etc. 
+    More Optimised than AF_XDP as it is a full user space stack
+    
+    Raw Packets will be received
+    Need to perform TCP/IP processing in user space (MTCP -> User space TCP/IP stack) 
+    Even after that that processing it shows better results than AF_XDP
+
+
+
+Memory Access Bottleneck
+
+Memory Wall: 
+  DRAM is slow, CPU is fast
+  On high speed n/w links -> only few 'ns' budgets per packet but accessing MM takes hundreds of 'ns'
+
+Direct Cache Access/ DDIO
+
+  NIC writes packet directly into CPU last level Cache, does not DMA into main memory
+  User/Kernel sofware can access packet directly from cache
+
+
+Challenges with DDIO
+
+  Some 'ways' in LLC reserved for DDIO, may impact other memory intensive applications
+  If the Application does not process the packet from the LLC in time then the packet will be evicted from the cache even if the appliction has not processed it, then again it has to be   fetched from the DRAM. -> Leaky DMA Problem
+    Solution: Limit no. of buffers in RX Ring? But what about bursty traffic?
+
+  
