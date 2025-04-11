@@ -67,6 +67,9 @@
 #define FRAME_SIZE XSK_UMEM__DEFAULT_FRAME_SIZE
 #define RX_BATCH_SIZE 64
 #define INVALID_UMEM_FRAME UINT64_MAX
+#define DNS_PORT 53
+#define MAX_DNS_PACKET 512
+
 
 int pkt_counter = 0;
 static struct xdp_program *prog;
@@ -276,6 +279,16 @@ error_exit:
 	return NULL;
 }
 
+
+// Structure to hold DNS response data
+struct dns_response
+{
+    uint8_t payload[MAX_DNS_PACKET];
+    size_t len;
+    char ipstr[INET6_ADDRSTRLEN];
+};
+
+
 static void complete_tx(struct xsk_socket_info *xsk)
 {
 	unsigned int completed;
@@ -321,20 +334,38 @@ static inline void csum_replace2(__sum16 *sum, __be16 old, __be16 new)
 	*sum = ~csum16_add(csum16_sub(~(*sum), old), new);
 }
 
-void parse_dns_query_name(uint8_t *dns_payload, char *hostname)
+// void parse_dns_query_name(uint8_t *dns_payload, char *hostname)
+// {
+// 	int i = 0, j = 0;
+// 	while (dns_payload[i] != 0)
+// 	{
+// 		int len = dns_payload[i];
+// 		for (int k = 0; k < len; ++k)
+// 		{
+// 			hostname[j++] = dns_payload[i + 1 + k];
+// 		}
+// 		hostname[j++] = '.';
+// 		i += len + 1;
+// 	}
+// 	hostname[j - 1] = '\0'; // Remove trailing dot
+// }
+
+static void parse_dns_query_name(uint8_t *dns_payload, char *hostname)
 {
-	int i = 0, j = 0;
-	while (dns_payload[i] != 0)
-	{
-		int len = dns_payload[i];
-		for (int k = 0; k < len; ++k)
-		{
-			hostname[j++] = dns_payload[i + 1 + k];
-		}
-		hostname[j++] = '.';
-		i += len + 1;
-	}
-	hostname[j - 1] = '\0'; // Remove trailing dot
+    int pos = 0, hostname_pos = 0;
+    uint8_t len;
+
+    while ((len = dns_payload[pos]) != 0)
+    {
+        if (pos + len + 1 > 255)
+            break; // Prevent buffer overflow
+        if (hostname_pos > 0)
+            hostname[hostname_pos++] = '.';
+        memcpy(hostname + hostname_pos, dns_payload + pos + 1, len);
+        hostname_pos += len;
+        pos += len + 1;
+    }
+    hostname[hostname_pos] = '\0';
 }
 
 // Log hostname to urls.log
@@ -386,463 +417,871 @@ void log_hostname_to_file(const char *hostname)
 //     freeaddrinfo(res);
 // }
 
-char *resolve_and_log_ip(const char *hostname)
+
+static inline uint16_t udp6_checksum(struct ip6_hdr *ip6, struct udphdr *udp, uint8_t *payload, int payload_len)
 {
-	char ipstr[INET6_ADDRSTRLEN];
+    uint32_t sum = 0;
+    uint16_t *ptr;
+    int i;
 
-	// Load existing cache
-	json_t *cache;
-	json_error_t error;
+    // Pseudo-header: src/dst IPv6 addresses
+    ptr = (uint16_t *)&ip6->ip6_src;
+    for (i = 0; i < 8; i++)
+        sum += ntohs(ptr[i]);
+    ptr = (uint16_t *)&ip6->ip6_dst;
+    for (i = 0; i < 8; i++)
+        sum += ntohs(ptr[i]);
 
-	FILE *cache_fp = fopen("resolve.json", "r");
-	if (cache_fp)
-	{
-		cache = json_loadf(cache_fp, 0, &error);
-		fclose(cache_fp);
-	}
-	else
-	{
-		cache = json_object(); // empty cache if file doesn't exist
-	}
+    // Length, next header
+    sum += ntohs(ip6->ip6_plen);
+    sum += IPPROTO_UDP;
 
-	if (!cache || !json_is_object(cache))
-	{
-		cache = json_object(); // reset if malformed
-	}
+    // UDP header
+    ptr = (uint16_t *)udp;
+    for (i = 0; i < sizeof(struct udphdr) / 2; i++)
+        sum += ntohs(ptr[i]);
 
-	// Check cache
-	json_t *cached_ip = json_object_get(cache, hostname);
-	if (cached_ip)
-	{
-		const char *cached_ip_str = strdup(json_string_value(cached_ip));
-		printf("[Cache Hit] %s -> %s\n", hostname, cached_ip_str);
-		json_decref(cache);
-		return cached_ip_str;
-	}
+    // Payload
+    ptr = (uint16_t *)payload;
+    for (i = 0; i < payload_len / 2; i++)
+        sum += ntohs(ptr[i]);
+    if (payload_len % 2)
+        sum += ntohs(payload[payload_len - 1] << 8);
 
-	// Not in cache, resolve using getaddrinfo
-	struct addrinfo hints, *res;
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_UNSPEC; // IPv4 or IPv6
-
-	int status = getaddrinfo(hostname, NULL, &hints, &res);
-	if (status != 0)
-	{
-		json_decref(cache);
-		return NULL; // DNS resolution failed
-	}
-
-	for (struct addrinfo *p = res; p != NULL; p = p->ai_next)
-	{
-		void *addr;
-		if (p->ai_family == AF_INET)
-		{
-			struct sockaddr_in *ipv4 = (struct sockaddr_in *)p->ai_addr;
-			addr = &(ipv4->sin_addr);
-		}
-		else if (p->ai_family == AF_INET6)
-		{
-			struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)p->ai_addr;
-			addr = &(ipv6->sin6_addr);
-		}
-		else
-		{
-			continue;
-		}
-
-		inet_ntop(p->ai_family, addr, ipstr, sizeof(ipstr));
-
-		// Add to JSON cache
-		json_object_set_new(cache, hostname, json_string(ipstr));
-
-		// Write updated cache to file
-		FILE *out_fp = fopen("resolve.json", "w");
-		if (out_fp)
-		{
-			json_dumpf(cache, out_fp, JSON_INDENT(2));
-			fclose(out_fp);
-		}
-
-		break; // Only log the first IP
-	}
-
-	freeaddrinfo(res);
-	json_decref(cache);
-	char *ret_ip = strdup(ipstr); // make a heap copy
-	return ret_ip;
+    // Fold 32-bit sum to 16 bits
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    return ~sum;
 }
 
-uint16_t checksum(uint16_t *buf, int nwords)
+static struct dns_response *resolve_and_log_ip(const char *hostname)
 {
-	uint32_t sum = 0;
-	for (; nwords > 0; nwords--)
-		sum += ntohs(*buf++);
-	sum = (sum >> 16) + (sum & 0xFFFF);
-	sum += (sum >> 16);
-	return htons((~sum) & 0xFFFF);
+    struct dns_response *result = malloc(sizeof(struct dns_response));
+    if (!result)
+    {
+        fprintf(stderr, "Failed to allocate dns_response\n");
+        return NULL;
+    }
+    memset(result, 0, sizeof(struct dns_response));
+
+    // Load existing cache
+    json_t *cache;
+    json_error_t error;
+
+    FILE *cache_fp = fopen("resolve.json", "r");
+    if (cache_fp)
+    {
+        cache = json_loadf(cache_fp, 0, &error);
+        fclose(cache_fp);
+    }
+    else
+    {
+        cache = json_object();
+    }
+
+    if (!cache || !json_is_object(cache))
+    {
+        cache = json_object();
+    }
+
+    // Check cache
+    json_t *cached_ip = json_object_get(cache, hostname);
+    // if (cached_ip)
+    // {
+    //     const char *cached_ip_str = json_string_value(cached_ip);
+    //     printf("[Cache Hit] %s -> %s\n", hostname, cached_ip_str);
+    //     snprintf(result->ipstr, INET6_ADDRSTRLEN, "%s", cached_ip_str);
+    //     result->len = 0; // Indicate cache hit, no full packet
+    //     json_decref(cache);
+    //     return result;
+    // }
+
+    // Create UDP socket
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0)
+    {
+        fprintf(stderr, "Failed to create socket: %s\n", strerror(errno));
+        free(result);
+        json_decref(cache);
+        return NULL;
+    }
+
+    // Set timeout
+    struct timeval timeout;
+    timeout.tv_sec = 5;
+    timeout.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    // Upstream resolver (Google DNS; change to 127.0.0.1 for dnsmasq)
+    struct sockaddr_in resolver_addr;
+    memset(&resolver_addr, 0, sizeof(resolver_addr));
+    resolver_addr.sin_family = AF_INET;
+    resolver_addr.sin_port = htons(DNS_PORT);
+    inet_pton(AF_INET, "8.8.8.8", &resolver_addr.sin_addr);
+
+    // Construct DNS query
+    uint8_t query[MAX_DNS_PACKET];
+    memset(query, 0, MAX_DNS_PACKET);
+    size_t query_len = 0;
+
+    // DNS header (12 bytes)
+    query[0] = 0x12;
+    query[1] = 0x34; // Transaction ID
+    query[2] = 0x01;
+    query[3] = 0x00; // Flags: standard query
+    query[4] = 0x00;
+    query[5] = 0x01; // Questions: 1
+    query[6] = 0x00;
+    query[7] = 0x00; // Answer RRs: 0
+    query[8] = 0x00;
+    query[9] = 0x00; // Authority RRs: 0
+    query[10] = 0x00;
+    query[11] = 0x00; // Additional RRs: 0
+    query_len += 12;
+
+    // Question section
+    char *name = strdup(hostname);
+    char *token = strtok(name, ".");
+    while (token)
+    {
+        size_t len = strlen(token);
+        query[query_len++] = len;
+        memcpy(query + query_len, token, len);
+        query_len += len;
+        token = strtok(NULL, ".");
+    }
+    query[query_len++] = 0x00; // End of name
+    free(name);
+
+    query[query_len++] = 0x00;
+    query[query_len++] = 0x01; // Type A
+    query[query_len++] = 0x00;
+    query[query_len++] = 0x01; // Class IN
+
+    // Send query
+    if (sendto(sock, query, query_len, 0, (struct sockaddr *)&resolver_addr, sizeof(resolver_addr)) < 0)
+    {
+        fprintf(stderr, "Failed to send query: %s\n", strerror(errno));
+        close(sock);
+        free(result);
+        json_decref(cache);
+        return NULL;
+    }
+
+    // Receive response
+    uint8_t response[MAX_DNS_PACKET];
+    ssize_t response_len = recvfrom(sock, response, MAX_DNS_PACKET, 0, NULL, NULL);
+    if (response_len < 0)
+    {
+        fprintf(stderr, "Failed to receive response: %s\n", strerror(errno));
+        close(sock);
+        free(result);
+        json_decref(cache);
+        return NULL;
+    }
+
+    close(sock);
+
+    // Copy response to result
+    memcpy(result->payload, response, response_len);
+    result->len = response_len;
+
+    // Extract IP from response (for caching)
+    size_t pos = 12; // Skip header
+    while (pos < response_len && response[pos] != 0)
+        pos++; // Skip question name
+    pos += 5;  // Skip null byte + QTYPE + QCLASS
+
+    if (pos + 10 < response_len && response[pos] == 0xC0 && response[pos + 3] == 0x01)
+    {
+        pos += 10; // Skip pointer, type, class, TTL, data len
+        if (pos + 4 <= response_len)
+        {
+            inet_ntop(AF_INET, response + pos, result->ipstr, INET6_ADDRSTRLEN);
+        }
+    }
+
+    if (strlen(result->ipstr) == 0)
+    {
+        fprintf(stderr, "No IPv4 address found for %s\n", hostname);
+        strcpy(result->ipstr, "192.168.1.100"); // Fallback
+    }
+
+    // Cache IP
+    json_object_set_new(cache, hostname, json_string(result->ipstr));
+    FILE *out_fp = fopen("resolve.json", "w");
+    if (out_fp)
+    {
+        json_dumpf(cache, out_fp, JSON_INDENT(2));
+        fclose(out_fp);
+    }
+
+    json_decref(cache);
+    printf("[Resolved] %s -> %s\n", hostname, result->ipstr);
+    return result;
 }
 
-uint16_t udp6_checksum(struct ip6_hdr *ip6, struct udphdr *udp, uint8_t *payload, int payload_len)
+// My code below
+
+// char *resolve_and_log_ip(const char *hostname)
+// {
+// 	char ipstr[INET6_ADDRSTRLEN];
+
+// 	// Load existing cache
+// 	json_t *cache;
+// 	json_error_t error;
+
+// 	FILE *cache_fp = fopen("resolve.json", "r");
+// 	if (cache_fp)
+// 	{
+// 		cache = json_loadf(cache_fp, 0, &error);
+// 		fclose(cache_fp);
+// 	}
+// 	else
+// 	{
+// 		cache = json_object(); // empty cache if file doesn't exist
+// 	}
+
+// 	if (!cache || !json_is_object(cache))
+// 	{
+// 		cache = json_object(); // reset if malformed
+// 	}
+
+// 	// Check cache
+// 	json_t *cached_ip = json_object_get(cache, hostname);
+// 	if (cached_ip)
+// 	{
+// 		const char *cached_ip_str = strdup(json_string_value(cached_ip));
+// 		// printf("[Cache Hit] %s -> %s\n", hostname, cached_ip_str);
+// 		json_decref(cache);
+// 		return cached_ip_str;
+// 	}
+
+// 	// Not in cache, resolve using getaddrinfo
+// 	struct addrinfo hints, *res;
+// 	memset(&hints, 0, sizeof(hints));
+// 	hints.ai_family = AF_UNSPEC; // IPv4 or IPv6
+
+// 	int status = getaddrinfo(hostname, NULL, &hints, &res);
+// 	if (status != 0)
+// 	{
+// 		json_decref(cache);
+// 		return NULL; // DNS resolution failed
+// 	}
+// 	// printf("Resolving %s...\n", hostname);
+
+// 	for (struct addrinfo *p = res; p != NULL; p = p->ai_next)
+// 	{
+// 		void *addr;
+// 		if (p->ai_family == AF_INET)
+// 		{
+// 			struct sockaddr_in *ipv4 = (struct sockaddr_in *)p->ai_addr;
+// 			addr = &(ipv4->sin_addr);
+// 		}
+// 		else if (p->ai_family == AF_INET6)
+// 		{
+// 			struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)p->ai_addr;
+// 			addr = &(ipv6->sin6_addr);
+// 		}
+// 		else
+// 		{
+// 			continue;
+// 		}
+
+// 		inet_ntop(p->ai_family, addr, ipstr, sizeof(ipstr));
+
+// 		// Add to JSON cache
+// 		json_object_set_new(cache, hostname, json_string(ipstr));
+
+// 		// Write updated cache to file
+// 		FILE *out_fp = fopen("resolve.json", "w");
+// 		if (out_fp)
+// 		{
+// 			json_dumpf(cache, out_fp, JSON_INDENT(2));
+// 			fclose(out_fp);
+// 		}
+
+// 		break; // Only log the first IP
+// 	}
+
+// 	freeaddrinfo(res);
+// 	json_decref(cache);
+// 	char *ret_ip = strdup(ipstr); // make a heap copy
+// 	return ret_ip;
+// }
+
+// uint16_t checksum(uint16_t *buf, int nwords)
+// {
+// 	uint32_t sum = 0;
+// 	for (; nwords > 0; nwords--)
+// 		sum += ntohs(*buf++);
+// 	sum = (sum >> 16) + (sum & 0xFFFF);
+// 	sum += (sum >> 16);
+// 	return htons((~sum) & 0xFFFF);
+// }
+
+// uint16_t udp6_checksum(struct ip6_hdr *ip6, struct udphdr *udp, uint8_t *payload, int payload_len)
+// {
+// 	struct
+// 	{
+// 		struct in6_addr src;
+// 		struct in6_addr dst;
+// 		uint32_t len;
+// 		uint8_t zero[3];
+// 		uint8_t nxt;
+// 	} pseudo_hdr;
+
+// 	memset(&pseudo_hdr, 0, sizeof(pseudo_hdr));
+// 	pseudo_hdr.src = ip6->ip6_src;
+// 	pseudo_hdr.dst = ip6->ip6_dst;
+// 	pseudo_hdr.len = htonl(sizeof(struct udphdr) + payload_len);
+// 	pseudo_hdr.nxt = IPPROTO_UDP;
+
+// 	// Combine pseudo header, UDP header, and payload into one buffer
+// 	int total_len = sizeof(pseudo_hdr) + sizeof(struct udphdr) + payload_len;
+// 	uint8_t *buf = malloc(total_len);
+// 	memcpy(buf, &pseudo_hdr, sizeof(pseudo_hdr));
+// 	memcpy(buf + sizeof(pseudo_hdr), udp, sizeof(struct udphdr));
+// 	memcpy(buf + sizeof(pseudo_hdr) + sizeof(struct udphdr), payload, payload_len);
+
+// 	uint16_t result = checksum((uint16_t *)buf, (total_len + 1) / 2);
+// 	free(buf);
+// 	return result;
+// }
+
+// static bool process_packet(struct xsk_socket_info *xsk,
+// 						   uint64_t addr, uint32_t len)
+// {
+// 	uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
+
+// 	// Modified
+// 	// uint8_t *dns_payload = pkt + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr);
+
+// 	// char hostname[256];
+// 	// parse_dns_query_name(dns_payload + 12, hostname);  // Skip DNS header (12 bytes)
+// 	// log_hostname_to_file(hostname);
+
+// 	struct ethhdr *eth = (struct ethhdr *)pkt;
+// 	char *ip_hostname;
+
+// 	if (ntohs(eth->h_proto) == ETH_P_IP)
+// 	{
+// 		struct iphdr *ip = (struct iphdr *)(pkt + sizeof(struct ethhdr));
+
+// 		if (ip->protocol == IPPROTO_UDP)
+// 		{
+// 			struct udphdr *udp = (struct udphdr *)((uint8_t *)ip + ip->ihl * 4);
+// 			uint8_t *dns_payload = (uint8_t *)udp + sizeof(struct udphdr);
+
+// 			char hostname[256];
+// 			parse_dns_query_name(dns_payload + 12, hostname);
+// 			log_hostname_to_file(hostname);
+// 			ip_hostname = resolve_and_log_ip(hostname);
+// 		}
+// 	}
+// 	else if (ntohs(eth->h_proto) == ETH_P_IPV6)
+// 	{
+// 		struct ip6_hdr *ip6 = (struct ip6_hdr *)(pkt + sizeof(struct ethhdr));
+
+// 		if (ip6->ip6_nxt == IPPROTO_UDP)
+// 		{
+// 			struct udphdr *udp = (struct udphdr *)(pkt + sizeof(struct ethhdr) + sizeof(struct ip6_hdr));
+// 			uint8_t *dns_payload = (uint8_t *)udp + sizeof(struct udphdr);
+
+// 			char hostname[256];
+// 			parse_dns_query_name(dns_payload + 12, hostname);
+// 			log_hostname_to_file(hostname);
+// 			ip_hostname = resolve_and_log_ip(hostname);
+// 			if (ip_hostname == NULL)
+// 			{
+// 				// fprintf(stderr, "Failed to resolve IP for hostname: %s\n", hostname);
+// 				return false; // Handle error appropriately
+// 			}
+// 		}
+// 	}
+
+// 	// printf("Hostname: %s\n", ip_hostname);
+
+// 	/* Log the raw packet into a file */
+// 	// FILE *log_file = fopen("packet_log.txt", "ab");
+// 	// if (log_file)
+// 	// {
+// 	// 	fwrite(pkt, 1, len, log_file);
+// 	// 	fclose(log_file);
+// 	// }
+// 	// else
+// 	// {
+// 	// 	fprintf(stderr, "Failed to open packet log file\n");
+// 	// }
+// 	// pkt_counter++;
+// 	// printf("Packet %d logged\n", pkt_counter);
+// 	/* Lesson#3: Write an IPv6 ICMP ECHO parser to send responses
+// 	 *
+// 	 * Some assumptions to make it easier:
+// 	 * - No VLAN handling
+// 	 * - Only if nexthdr is ICMP
+// 	 * - Just return all data with MAC/IP swapped, and type set to
+// 	 *   ICMPV6_ECHO_REPLY
+// 	 * - Recalculate the icmp checksum */
+
+// 	if (true)
+// 	{
+// 		int ret;
+// 		uint32_t tx_idx = 0;
+// 		uint8_t tmp_mac[ETH_ALEN];
+// 		struct in6_addr tmp_ip;
+
+// 		struct ethhdr *eth = (struct ethhdr *)pkt;
+
+// 		if (ntohs(eth->h_proto) == ETH_P_IP)
+// 		{
+// 			struct iphdr *ip = (struct iphdr *)(pkt + sizeof(struct ethhdr));
+
+// 			if (ip->protocol == IPPROTO_UDP)
+// 			{
+// 				struct udphdr *udp = (struct udphdr *)(pkt + sizeof(struct ethhdr) + sizeof(struct iphdr));
+// 				uint8_t *dns_payload = (uint8_t *)udp + sizeof(struct udphdr);
+
+// 				// Create a DNS reply packet with a random IP address
+// 				uint8_t dns_reply[512]; // Buffer for DNS reply
+// 				memset(dns_reply, 0, sizeof(dns_reply));
+
+// 				// Copy the DNS header from the request
+// 				memcpy(dns_reply, dns_payload, 12);
+
+// 				// Set the response flags
+// 				dns_reply[2] |= 0x80; // Set QR (response) bit
+// 				dns_reply[3] |= 0x80; // Set RA (Recursion Available) bit
+
+// 				// Copy the question section
+// 				int question_len = len - (dns_payload - pkt) - 12;
+// 				memcpy(dns_reply + 12, dns_payload + 12, question_len);
+
+// 				// Add the answer section
+// 				int answer_offset = 12 + question_len;
+// 				memcpy(dns_reply + answer_offset, dns_payload + 12, question_len); // Copy the question as the answer name
+// 				answer_offset += question_len;
+
+// 				// Set the answer type (A record) and class (IN)
+// 				dns_reply[answer_offset++] = 0x00;
+// 				dns_reply[answer_offset++] = 0x01; // Type A
+// 				dns_reply[answer_offset++] = 0x00;
+// 				dns_reply[answer_offset++] = 0x01; // Class IN
+
+// 				// Set the TTL (Time to Live)
+// 				dns_reply[answer_offset++] = 0x00;
+// 				dns_reply[answer_offset++] = 0x00;
+// 				dns_reply[answer_offset++] = 0x00;
+// 				dns_reply[answer_offset++] = 0x3C; // TTL = 60 seconds
+
+// 				// Set the data length (4 bytes for IPv4 address)
+// 				dns_reply[answer_offset++] = 0x00;
+// 				dns_reply[answer_offset++] = 0x04;
+
+// 				// Add a random IPv4 address as the answer
+// 				dns_reply[answer_offset++] = 192;
+// 				dns_reply[answer_offset++] = 168;
+// 				dns_reply[answer_offset++] = 1;
+// 				dns_reply[answer_offset++] = 100;
+
+// 				// Update the UDP length
+// 				// udp->len = htons(answer_offset + sizeof(struct udphdr));
+
+// 				// Copy the DNS reply back to the packet
+// 				memcpy(dns_payload, dns_reply, answer_offset);
+
+// 				// Update the IP length
+// 				// ip->tot_len = htons(sizeof(struct iphdr) + sizeof(struct udphdr) + answer_offset);
+
+// 				// Recalculate the UDP checksum
+// 				udp->check = 0;
+// 				udp->check = csum16_add(udp->check, htons(answer_offset + sizeof(struct udphdr)));
+// 			}
+// 		}
+// 		else if (ntohs(eth->h_proto) == ETH_P_IPV6)
+// 		{
+// 			// struct ethhdr *eth = (struct ethhdr *)pkt;
+// 			struct ip6_hdr *ip6 = (struct ip6_hdr *)(pkt + sizeof(struct ethhdr));
+
+// 			if (ip6->ip6_nxt != IPPROTO_UDP)
+// 				return;
+
+// 			struct udphdr *udp = (struct udphdr *)(pkt + sizeof(struct ethhdr) + sizeof(struct ip6_hdr));
+// 			uint8_t *dns_payload = (uint8_t *)(udp + 1);
+// 			int dns_payload_len = ntohs(udp->len) - sizeof(struct udphdr);
+
+// 			// Allocate DNS reply buffer
+// 			uint8_t dns_reply[512];
+// 			memset(dns_reply, 0, sizeof(dns_reply));
+
+// 			// Copy DNS header
+// 			memcpy(dns_reply, dns_payload, 12);
+
+// 			// Set flags: response, recursion available
+// 			dns_reply[2] |= 0x80;
+// 			dns_reply[3] |= 0x80;
+
+// 			// Set answer count to 1
+// 			dns_reply[6] = 0x00;
+// 			dns_reply[7] = 0x01;
+
+// 			// Copy question section
+// 			int question_len = 0;
+// 			while (dns_payload[12 + question_len] != 0x00 && (12 + question_len) < dns_payload_len)
+// 			{
+// 				question_len++;
+// 			}
+// 			question_len += 5; // +1 for null, +4 for QTYPE and QCLASS
+
+// 			memcpy(dns_reply + 12, dns_payload + 12, question_len);
+
+// 			// Write answer section with compression pointer
+// 			int offset = 12 + question_len;
+// 			dns_reply[offset++] = 0xC0;
+// 			dns_reply[offset++] = 0x0C; // pointer to the question
+
+// 			// Type A (IPv4)
+// 			dns_reply[offset++] = 0x00;
+// 			dns_reply[offset++] = 0x01;
+
+// 			// Class IN
+// 			dns_reply[offset++] = 0x00;
+// 			dns_reply[offset++] = 0x01;
+
+// 			// TTL
+// 			dns_reply[offset++] = 0x00;
+// 			dns_reply[offset++] = 0x00;
+// 			dns_reply[offset++] = 0x00;
+// 			dns_reply[offset++] = 0x3C;
+
+// 			// RDLENGTH = 4
+// 			dns_reply[offset++] = 0x00;
+// 			dns_reply[offset++] = 0x04;
+
+// 			// Random IPv4 address (e.g., 192.168.1.100)
+// 			// dns_reply[offset++] = 123;
+// 			// dns_reply[offset++] = 123;
+// 			// dns_reply[offset++] = 123;
+// 			// dns_reply[offset++] = 123;
+// 			struct in_addr ip_addr;
+// 			if (inet_pton(AF_INET, ip_hostname, &ip_addr) == 1)
+// 			{
+// 				memcpy(&dns_reply[offset], &ip_addr, 4);
+// 				offset += 4;
+// 			}
+// 			else
+// 			{
+// 				// fprintf(stderr, "Invalid IP address format: %s\n", ip_hostname);
+// 				return; // or handle the error appropriately
+// 			}
+
+// 			// Handle OPT (EDNS0) Additional Record if present
+// 			int opt_start = 12 + question_len + 16;			  // question + 16-byte answer
+// 			int opt_len = dns_payload_len - (opt_start - 12); // Remaining bytes in original payload
+
+// 			if (opt_len > 0 && dns_payload[opt_start + 1] == 0x00 && dns_payload[opt_start + 3] == 0x29)
+// 			{
+// 				// Confirm it's an OPT RR (Type 41 = 0x0029)
+// 				memcpy(dns_reply + offset, dns_payload + opt_start, opt_len);
+// 				offset += opt_len;
+
+// 				// Set ARCOUNT = 1 (1 Additional Record)
+// 				dns_reply[10] = 0x00;
+// 				dns_reply[11] = 0x01;
+// 			}
+// 			else
+// 			{
+// 				// No additional record
+// 				dns_reply[10] = 0x00;
+// 				dns_reply[11] = 0x00;
+// 			}
+
+// 			int dns_reply_len = offset;
+
+// 			// Copy DNS reply back to original packet
+// 			memcpy(dns_payload, dns_reply, dns_reply_len);
+
+// 			// Update UDP length
+// 			udp->len = htons(dns_reply_len + sizeof(struct udphdr));
+
+// 			// Update IPv6 payload length
+// 			ip6->ip6_plen = htons(dns_reply_len + sizeof(struct udphdr));
+
+// 			// Recompute UDP checksum
+// 			udp->check = 0;
+// 			udp->check = udp6_checksum(ip6, udp, dns_payload, dns_reply_len);
+
+// 			// Swap MACs
+// 			uint8_t tmp_mac[ETH_ALEN];
+// 			memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
+// 			memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+// 			memcpy(eth->h_source, tmp_mac, ETH_ALEN);
+
+// 			// Swap IPv6 addresses
+// 			struct in6_addr tmp_ip;
+// 			memcpy(&tmp_ip, &ip6->ip6_src, sizeof(tmp_ip));
+// 			memcpy(&ip6->ip6_src, &ip6->ip6_dst, sizeof(tmp_ip));
+// 			memcpy(&ip6->ip6_dst, &tmp_ip, sizeof(tmp_ip));
+
+// 			// printf("Processed IPv6 packet\n");
+// 		}
+
+// 		// struct ethhdr *eth = (struct ethhdr *) pkt;
+// 		// struct ipv6hdr *ipv6 = (struct ipv6hdr *) (eth + 1);
+// 		// struct icmp6hdr *icmp = (struct icmp6hdr *) (ipv6 + 1);
+
+// 		// if (ntohs(eth->h_proto) != ETH_P_IPV6 ||
+// 		//     len < (sizeof(*eth) + sizeof(*ipv6) + sizeof(*icmp)) ||
+// 		//     ipv6->nexthdr != IPPROTO_ICMPV6 ||
+// 		//     icmp->icmp6_type != ICMPV6_ECHO_REQUEST)
+// 		// 	return false;
+
+// 		// memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
+// 		// memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+// 		// memcpy(eth->h_source, tmp_mac, ETH_ALEN);
+
+// 		// memcpy(&tmp_ip, &ipv6->saddr, sizeof(tmp_ip));
+// 		// memcpy(&ipv6->saddr, &ipv6->daddr, sizeof(tmp_ip));
+// 		// memcpy(&ipv6->daddr, &tmp_ip, sizeof(tmp_ip));
+
+// 		// icmp->icmp6_type = ICMPV6_ECHO_REPLY;
+
+// 		// csum_replace2(&icmp->icmp6_cksum,
+// 		// 	      htons(ICMPV6_ECHO_REQUEST << 8),
+// 		// 	      htons(ICMPV6_ECHO_REPLY << 8));
+
+// 		/* Here we sent the packet out of the receive port. Note that
+// 		 * we allocate one entry and schedule it. Your design would be
+// 		 * faster if you do batch processing/transmission */
+
+// 		// /* Reserve a transmit slot */
+// 		ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
+// 		if (ret != 1)
+// 		{
+// 			/* No more transmit slots, drop the packet */
+// 			return false;
+// 		}
+
+// 		/* Submit the packet for transmission */
+// 		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
+// 		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = len;
+// 		xsk_ring_prod__submit(&xsk->tx, 1);
+// 		xsk->outstanding_tx++;
+
+// 		/* Print packet details */
+// 		// uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
+// 		// printf("Packet submitted for transmission:\n");
+// 		// printf("Length: %u bytes\n", len);
+// 		// printf("Data (first 64 bytes): ");
+// 		// for (uint32_t i = 0; i < len && i < 64; i++)
+// 		// {
+// 		// 	printf("%02x ", pkt[i]);
+// 		// }
+// 		// printf("\n");
+
+// 		/* Update statistics */
+// 		xsk->stats.tx_bytes += len;
+// 		xsk->stats.tx_packets++;
+// 		return true;
+// 	}
+
+// 	return false;
+// }
+
+
+static bool process_packet(struct xsk_socket_info *xsk, uint64_t addr, uint32_t len)
 {
-	struct
-	{
-		struct in6_addr src;
-		struct in6_addr dst;
-		uint32_t len;
-		uint8_t zero[3];
-		uint8_t nxt;
-	} pseudo_hdr;
-
-	memset(&pseudo_hdr, 0, sizeof(pseudo_hdr));
-	pseudo_hdr.src = ip6->ip6_src;
-	pseudo_hdr.dst = ip6->ip6_dst;
-	pseudo_hdr.len = htonl(sizeof(struct udphdr) + payload_len);
-	pseudo_hdr.nxt = IPPROTO_UDP;
-
-	// Combine pseudo header, UDP header, and payload into one buffer
-	int total_len = sizeof(pseudo_hdr) + sizeof(struct udphdr) + payload_len;
-	uint8_t *buf = malloc(total_len);
-	memcpy(buf, &pseudo_hdr, sizeof(pseudo_hdr));
-	memcpy(buf + sizeof(pseudo_hdr), udp, sizeof(struct udphdr));
-	memcpy(buf + sizeof(pseudo_hdr) + sizeof(struct udphdr), payload, payload_len);
-
-	uint16_t result = checksum((uint16_t *)buf, (total_len + 1) / 2);
-	free(buf);
-	return result;
-}
-
-static bool process_packet(struct xsk_socket_info *xsk,
-						   uint64_t addr, uint32_t len)
-{
-	uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
-
-	// Modified
-	// uint8_t *dns_payload = pkt + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr);
-
-	// char hostname[256];
-	// parse_dns_query_name(dns_payload + 12, hostname);  // Skip DNS header (12 bytes)
-	// log_hostname_to_file(hostname);
-
-	struct ethhdr *eth = (struct ethhdr *)pkt;
-	char *ip_hostname;
-
-	if (ntohs(eth->h_proto) == ETH_P_IP)
-	{
-		struct iphdr *ip = (struct iphdr *)(pkt + sizeof(struct ethhdr));
-
-		if (ip->protocol == IPPROTO_UDP)
-		{
-			struct udphdr *udp = (struct udphdr *)((uint8_t *)ip + ip->ihl * 4);
-			uint8_t *dns_payload = (uint8_t *)udp + sizeof(struct udphdr);
-
-			char hostname[256];
-			parse_dns_query_name(dns_payload + 12, hostname);
-			log_hostname_to_file(hostname);
-			ip_hostname = resolve_and_log_ip(hostname);
-		}
-	}
-	else if (ntohs(eth->h_proto) == ETH_P_IPV6)
-	{
-		struct ip6_hdr *ip6 = (struct ip6_hdr *)(pkt + sizeof(struct ethhdr));
-
-		if (ip6->ip6_nxt == IPPROTO_UDP)
-		{
-			struct udphdr *udp = (struct udphdr *)(pkt + sizeof(struct ethhdr) + sizeof(struct ip6_hdr));
-			uint8_t *dns_payload = (uint8_t *)udp + sizeof(struct udphdr);
-
-			char hostname[256];
-			parse_dns_query_name(dns_payload + 12, hostname);
-			log_hostname_to_file(hostname);
-			ip_hostname = resolve_and_log_ip(hostname);
-		}
-	}
-
-	printf("Hostname: %s\n", ip_hostname);
-
-	/* Log the raw packet into a file */
-	FILE *log_file = fopen("packet_log.txt", "ab");
-	if (log_file)
-	{
-		fwrite(pkt, 1, len, log_file);
-		fclose(log_file);
-	}
-	else
-	{
-		fprintf(stderr, "Failed to open packet log file\n");
-	}
-	pkt_counter++;
-	printf("Packet %d logged\n", pkt_counter);
-	/* Lesson#3: Write an IPv6 ICMP ECHO parser to send responses
-	 *
-	 * Some assumptions to make it easier:
-	 * - No VLAN handling
-	 * - Only if nexthdr is ICMP
-	 * - Just return all data with MAC/IP swapped, and type set to
-	 *   ICMPV6_ECHO_REPLY
-	 * - Recalculate the icmp checksum */
-
-	if (true)
-	{
-		int ret;
-		uint32_t tx_idx = 0;
-		uint8_t tmp_mac[ETH_ALEN];
-		struct in6_addr tmp_ip;
-
-		struct ethhdr *eth = (struct ethhdr *)pkt;
-
-		if (ntohs(eth->h_proto) == ETH_P_IP)
-		{
-			struct iphdr *ip = (struct iphdr *)(pkt + sizeof(struct ethhdr));
-
-			if (ip->protocol == IPPROTO_UDP)
-			{
-				struct udphdr *udp = (struct udphdr *)((uint8_t *)ip + ip->ihl * 4);
-				uint8_t *dns_payload = (uint8_t *)udp + sizeof(struct udphdr);
-
-				// Create a DNS reply packet with a random IP address
-				uint8_t dns_reply[512]; // Buffer for DNS reply
-				memset(dns_reply, 0, sizeof(dns_reply));
-
-				// Copy the DNS header from the request
-				memcpy(dns_reply, dns_payload, 12);
-
-				// Set the response flags
-				dns_reply[2] |= 0x80; // Set QR (response) bit
-				dns_reply[3] |= 0x80; // Set RA (Recursion Available) bit
-
-				// Copy the question section
-				int question_len = len - (dns_payload - pkt) - 12;
-				memcpy(dns_reply + 12, dns_payload + 12, question_len);
-
-				// Add the answer section
-				int answer_offset = 12 + question_len;
-				memcpy(dns_reply + answer_offset, dns_payload + 12, question_len); // Copy the question as the answer name
-				answer_offset += question_len;
-
-				// Set the answer type (A record) and class (IN)
-				dns_reply[answer_offset++] = 0x00;
-				dns_reply[answer_offset++] = 0x01; // Type A
-				dns_reply[answer_offset++] = 0x00;
-				dns_reply[answer_offset++] = 0x01; // Class IN
-
-				// Set the TTL (Time to Live)
-				dns_reply[answer_offset++] = 0x00;
-				dns_reply[answer_offset++] = 0x00;
-				dns_reply[answer_offset++] = 0x00;
-				dns_reply[answer_offset++] = 0x3C; // TTL = 60 seconds
-
-				// Set the data length (4 bytes for IPv4 address)
-				dns_reply[answer_offset++] = 0x00;
-				dns_reply[answer_offset++] = 0x04;
-
-				// Add a random IPv4 address as the answer
-				dns_reply[answer_offset++] = 192;
-				dns_reply[answer_offset++] = 168;
-				dns_reply[answer_offset++] = 1;
-				dns_reply[answer_offset++] = 100;
-
-				// Update the UDP length
-				udp->len = htons(answer_offset + sizeof(struct udphdr) - (dns_payload - pkt));
-
-				// Copy the DNS reply back to the packet
-				memcpy(dns_payload, dns_reply, answer_offset);
-
-				// Update the IP length
-				ip->tot_len = htons(answer_offset + sizeof(struct udphdr) + ip->ihl * 4);
-
-				// Recalculate the UDP checksum
-				udp->check = 0;
-				udp->check = csum16_add(udp->check, htons(answer_offset + sizeof(struct udphdr)));
-			}
-		}
-		else if (ntohs(eth->h_proto) == ETH_P_IPV6)
-		{
-			// struct ethhdr *eth = (struct ethhdr *)pkt;
-			struct ip6_hdr *ip6 = (struct ip6_hdr *)(pkt + sizeof(struct ethhdr));
-
-			if (ip6->ip6_nxt != IPPROTO_UDP)
-				return;
-
-			struct udphdr *udp = (struct udphdr *)(pkt + sizeof(struct ethhdr) + sizeof(struct ip6_hdr));
-			uint8_t *dns_payload = (uint8_t *)(udp + 1);
-			int dns_payload_len = ntohs(udp->len) - sizeof(struct udphdr);
-
-			// Allocate DNS reply buffer
-			uint8_t dns_reply[512];
-			memset(dns_reply, 0, sizeof(dns_reply));
-
-			// Copy DNS header
-			memcpy(dns_reply, dns_payload, 12);
-
-			// Set flags: response, recursion available
-			dns_reply[2] |= 0x80;
-			dns_reply[3] |= 0x80;
-
-			// Set answer count to 1
-			dns_reply[6] = 0x00;
-			dns_reply[7] = 0x01;
-
-			// Copy question section
-			int question_len = 0;
-			while (dns_payload[12 + question_len] != 0x00 && (12 + question_len) < dns_payload_len)
-			{
-				question_len++;
-			}
-			question_len += 5; // +1 for null, +4 for QTYPE and QCLASS
-
-			memcpy(dns_reply + 12, dns_payload + 12, question_len);
-
-			// Write answer section with compression pointer
-			int offset = 12 + question_len;
-			dns_reply[offset++] = 0xC0;
-			dns_reply[offset++] = 0x0C; // pointer to the question
-
-			// Type A (IPv4)
-			dns_reply[offset++] = 0x00;
-			dns_reply[offset++] = 0x01;
-
-			// Class IN
-			dns_reply[offset++] = 0x00;
-			dns_reply[offset++] = 0x01;
-
-			// TTL
-			dns_reply[offset++] = 0x00;
-			dns_reply[offset++] = 0x00;
-			dns_reply[offset++] = 0x00;
-			dns_reply[offset++] = 0x3C;
-
-			// RDLENGTH = 4
-			dns_reply[offset++] = 0x00;
-			dns_reply[offset++] = 0x04;
-
-			// Random IPv4 address (e.g., 192.168.1.100)
-			// dns_reply[offset++] = 123;
-			// dns_reply[offset++] = 123;
-			// dns_reply[offset++] = 123;
-			// dns_reply[offset++] = 123;
-			struct in_addr ip_addr;
-			if (inet_pton(AF_INET, ip_hostname, &ip_addr) == 1)
-			{
-				memcpy(&dns_reply[offset], &ip_addr, 4);
-				offset += 4;
-			}
-			else
-			{
-				fprintf(stderr, "Invalid IP address format: %s\n", ip_hostname);
-				return; // or handle the error appropriately
-			}
-
-			// Handle OPT (EDNS0) Additional Record if present
-			int opt_start = 12 + question_len + 16;			  // question + 16-byte answer
-			int opt_len = dns_payload_len - (opt_start - 12); // Remaining bytes in original payload
-
-			if (opt_len > 0 && dns_payload[opt_start + 1] == 0x00 && dns_payload[opt_start + 3] == 0x29)
-			{
-				// Confirm it's an OPT RR (Type 41 = 0x0029)
-				memcpy(dns_reply + offset, dns_payload + opt_start, opt_len);
-				offset += opt_len;
-
-				// Set ARCOUNT = 1 (1 Additional Record)
-				dns_reply[10] = 0x00;
-				dns_reply[11] = 0x01;
-			}
-			else
-			{
-				// No additional record
-				dns_reply[10] = 0x00;
-				dns_reply[11] = 0x00;
-			}
-
-			int dns_reply_len = offset;
-
-			// Copy DNS reply back to original packet
-			memcpy(dns_payload, dns_reply, dns_reply_len);
-
-			// Update UDP length
-			udp->len = htons(dns_reply_len + sizeof(struct udphdr));
-
-			// Update IPv6 payload length
-			ip6->ip6_plen = htons(dns_reply_len + sizeof(struct udphdr));
-
-			// Recompute UDP checksum
-			udp->check = 0;
-			udp->check = udp6_checksum(ip6, udp, dns_payload, dns_reply_len);
-
-			// Swap MACs
-			uint8_t tmp_mac[ETH_ALEN];
-			memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
-			memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
-			memcpy(eth->h_source, tmp_mac, ETH_ALEN);
-
-			// Swap IPv6 addresses
-			struct in6_addr tmp_ip;
-			memcpy(&tmp_ip, &ip6->ip6_src, sizeof(tmp_ip));
-			memcpy(&ip6->ip6_src, &ip6->ip6_dst, sizeof(tmp_ip));
-			memcpy(&ip6->ip6_dst, &tmp_ip, sizeof(tmp_ip));
-
-			printf("Processed IPv6 packet\n");
-		}
-
-		// struct ethhdr *eth = (struct ethhdr *) pkt;
-		// struct ipv6hdr *ipv6 = (struct ipv6hdr *) (eth + 1);
-		// struct icmp6hdr *icmp = (struct icmp6hdr *) (ipv6 + 1);
-
-		// if (ntohs(eth->h_proto) != ETH_P_IPV6 ||
-		//     len < (sizeof(*eth) + sizeof(*ipv6) + sizeof(*icmp)) ||
-		//     ipv6->nexthdr != IPPROTO_ICMPV6 ||
-		//     icmp->icmp6_type != ICMPV6_ECHO_REQUEST)
-		// 	return false;
-
-		// memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
-		// memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
-		// memcpy(eth->h_source, tmp_mac, ETH_ALEN);
-
-		// memcpy(&tmp_ip, &ipv6->saddr, sizeof(tmp_ip));
-		// memcpy(&ipv6->saddr, &ipv6->daddr, sizeof(tmp_ip));
-		// memcpy(&ipv6->daddr, &tmp_ip, sizeof(tmp_ip));
-
-		// icmp->icmp6_type = ICMPV6_ECHO_REPLY;
-
-		// csum_replace2(&icmp->icmp6_cksum,
-		// 	      htons(ICMPV6_ECHO_REQUEST << 8),
-		// 	      htons(ICMPV6_ECHO_REPLY << 8));
-
-		/* Here we sent the packet out of the receive port. Note that
-		 * we allocate one entry and schedule it. Your design would be
-		 * faster if you do batch processing/transmission */
-
-		// /* Reserve a transmit slot */
-		ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
-		if (ret != 1)
-		{
-			/* No more transmit slots, drop the packet */
-			return false;
-		}
-
-		/* Submit the packet for transmission */
-		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
-		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = len;
-		xsk_ring_prod__submit(&xsk->tx, 1);
-		xsk->outstanding_tx++;
-
-		/* Print packet details */
-		// uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
-		// printf("Packet submitted for transmission:\n");
-		// printf("Length: %u bytes\n", len);
-		// printf("Data (first 64 bytes): ");
-		// for (uint32_t i = 0; i < len && i < 64; i++)
-		// {
-		// 	printf("%02x ", pkt[i]);
-		// }
-		// printf("\n");
-
-		/* Update statistics */
-		xsk->stats.tx_bytes += len;
-		xsk->stats.tx_packets++;
-		return true;
-	}
-
-	return false;
+    uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
+    struct ethhdr *eth = (struct ethhdr *)pkt;
+    struct dns_response *dns_res = NULL;
+    bool is_ipv4 = (ntohs(eth->h_proto) == ETH_P_IP);
+    bool is_ipv6 = (ntohs(eth->h_proto) == ETH_P_IPV6);
+    uint32_t tx_idx = 0;
+    int ret;
+
+    if (is_ipv4)
+    {
+        struct iphdr *ip = (struct iphdr *)(pkt + sizeof(struct ethhdr));
+        if (ip->protocol == IPPROTO_UDP)
+        {
+            struct udphdr *udp = (struct udphdr *)((uint8_t *)ip + ip->ihl * 4);
+            uint8_t *dns_payload = (uint8_t *)udp + sizeof(struct udphdr);
+            char hostname[256];
+            parse_dns_query_name(dns_payload + 12, hostname);
+            log_hostname_to_file(hostname);
+            dns_res = resolve_and_log_ip(hostname);
+
+            if (!dns_res || (dns_res->len == 0 && strlen(dns_res->ipstr) == 0))
+            {
+                fprintf(stderr, "No valid response for %s\n", hostname);
+                if (dns_res)
+                    free(dns_res);
+                return false;
+            }
+
+            if (dns_res->len > 0)
+            {
+                memcpy(dns_payload, dns_res->payload, dns_res->len);
+                udp->len = htons(dns_res->len + sizeof(struct udphdr));
+                ip->tot_len = htons(dns_res->len + sizeof(struct udphdr) + ip->ihl * 4);
+                udp->check = 0; // Kernel recalculates
+            }
+            else
+            {
+                uint8_t dns_reply[512];
+                memset(dns_reply, 0, sizeof(dns_reply));
+                memcpy(dns_reply, dns_payload, 12);
+                dns_reply[2] |= 0x80; // QR bit
+                dns_reply[3] |= 0x80; // RA bit
+                dns_reply[7] = 0x01;  // One answer
+                int question_len = len - ((uint8_t *)dns_payload - pkt) - 12;
+                memcpy(dns_reply + 12, dns_payload + 12, question_len);
+                int answer_offset = 12 + question_len;
+                dns_reply[answer_offset++] = 0xC0;
+                dns_reply[answer_offset++] = 0x0C;
+                dns_reply[answer_offset++] = 0x00;
+                dns_reply[answer_offset++] = 0x01;
+                dns_reply[answer_offset++] = 0x00;
+                dns_reply[answer_offset++] = 0x01;
+                dns_reply[answer_offset++] = 0x00;
+                dns_reply[answer_offset++] = 0x00;
+                dns_reply[answer_offset++] = 0x00;
+                dns_reply[answer_offset++] = 0x3C;
+                dns_reply[answer_offset++] = 0x00;
+                dns_reply[answer_offset++] = 0x04;
+                struct in_addr ip_addr;
+                inet_pton(AF_INET, dns_res->ipstr, &ip_addr);
+                memcpy(dns_reply + answer_offset, &ip_addr, 4);
+                answer_offset += 4;
+                memcpy(dns_payload, dns_reply, answer_offset);
+                udp->len = htons(answer_offset + sizeof(struct udphdr));
+                ip->tot_len = htons(answer_offset + sizeof(struct udphdr) + ip->ihl * 4);
+                udp->check = 0;
+            }
+
+            uint8_t tmp_mac[ETH_ALEN];
+            memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
+            memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+            memcpy(eth->h_source, tmp_mac, ETH_ALEN);
+            uint32_t tmp_ip = ip->saddr;
+            ip->saddr = ip->daddr;
+            ip->daddr = tmp_ip;
+        }
+    }
+    else if (is_ipv6)
+    {
+        struct ip6_hdr *ip6 = (struct ip6_hdr *)(pkt + sizeof(struct ethhdr));
+        if (ip6->ip6_nxt == IPPROTO_UDP)
+        {
+            struct udphdr *udp = (struct udphdr *)(pkt + sizeof(struct ethhdr) + sizeof(struct ip6_hdr));
+            uint8_t *dns_payload = (uint8_t *)udp + sizeof(struct udphdr);
+            int dns_payload_len = ntohs(udp->len) - sizeof(struct udphdr);
+            char hostname[256];
+            parse_dns_query_name(dns_payload + 12, hostname);
+            log_hostname_to_file(hostname);
+            dns_res = resolve_and_log_ip(hostname);
+
+            if (!dns_res || (dns_res->len == 0 && strlen(dns_res->ipstr) == 0))
+            {
+                fprintf(stderr, "No valid response for %s\n", hostname);
+                if (dns_res)
+                    free(dns_res);
+                return false;
+            }
+
+            if (dns_res->len > 0)
+            {
+                memcpy(dns_payload, dns_res->payload, dns_res->len);
+                udp->len = htons(dns_res->len + sizeof(struct udphdr));
+                ip6->ip6_plen = htons(dns_res->len + sizeof(struct udphdr));
+                udp->check = 0;
+                udp->check = udp6_checksum(ip6, udp, dns_payload, dns_res->len);
+            }
+            else
+            {
+                uint8_t dns_reply[512];
+                memset(dns_reply, 0, sizeof(dns_reply));
+                memcpy(dns_reply, dns_payload, 12);
+                dns_reply[2] |= 0x80; // QR bit
+                dns_reply[3] |= 0x80; // RA bit
+                dns_reply[7] = 0x01;  // One answer
+                int question_len = 0;
+                while (dns_payload[12 + question_len] != 0x00 && (12 + question_len) < dns_payload_len)
+                {
+                    question_len++;
+                }
+                question_len += 5;
+                memcpy(dns_reply + 12, dns_payload + 12, question_len);
+                int answer_offset = 12 + question_len;
+                dns_reply[answer_offset++] = 0xC0;
+                dns_reply[answer_offset++] = 0x0C;
+                dns_reply[answer_offset++] = 0x00;
+                dns_reply[answer_offset++] = 0x01;
+                dns_reply[answer_offset++] = 0x00;
+                dns_reply[answer_offset++] = 0x01;
+                dns_reply[answer_offset++] = 0x00;
+                dns_reply[answer_offset++] = 0x00;
+                dns_reply[answer_offset++] = 0x00;
+                dns_reply[answer_offset++] = 0x3C;
+                dns_reply[answer_offset++] = 0x00;
+                dns_reply[answer_offset++] = 0x04;
+                struct in_addr ip_addr;
+                inet_pton(AF_INET, dns_res->ipstr, &ip_addr);
+                memcpy(dns_reply + answer_offset, &ip_addr, 4);
+                answer_offset += 4;
+                if (dns_payload_len > question_len + 12)
+                {
+                    memcpy(dns_reply + answer_offset, dns_payload + 12 + question_len, dns_payload_len - (12 + question_len));
+                    answer_offset += dns_payload_len - (12 + question_len);
+                    dns_reply[11] = 0x01; // ARCOUNT
+                }
+                memcpy(dns_payload, dns_reply, answer_offset);
+                udp->len = htons(answer_offset + sizeof(struct udphdr));
+                ip6->ip6_plen = htons(answer_offset + sizeof(struct udphdr));
+                udp->check = 0;
+                udp->check = udp6_checksum(ip6, udp, dns_payload, answer_offset);
+            }
+
+            uint8_t tmp_mac[ETH_ALEN];
+            memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
+            memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+            memcpy(eth->h_source, tmp_mac, ETH_ALEN);
+            struct in6_addr tmp_ip;
+            memcpy(&tmp_ip, &ip6->ip6_src, sizeof(tmp_ip));
+            memcpy(&ip6->ip6_src, &ip6->ip6_dst, sizeof(tmp_ip));
+            memcpy(&ip6->ip6_dst, &tmp_ip, sizeof(tmp_ip));
+        }
+    }
+
+    if (dns_res)
+    {
+        free(dns_res);
+    }
+
+    FILE *log_file = fopen("packet_log.txt", "ab");
+    if (log_file)
+    {
+        fwrite(pkt, 1, len, log_file);
+        fclose(log_file);
+    }
+
+    ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
+    if (ret != 1)
+    {
+        fprintf(stderr, "Failed to reserve TX slot\n");
+        return false;
+    }
+
+    xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
+    xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = len;
+    xsk_ring_prod__submit(&xsk->tx, 1);
+    xsk->outstanding_tx++;
+
+    xsk->stats.tx_bytes += len;
+    xsk->stats.tx_packets++;
+    pkt_counter++;
+    printf("Packet %d sent: %s\n", pkt_counter, dns_res && dns_res->ipstr[0] ? dns_res->ipstr : "unknown");
+    return true;
 }
 
 static void handle_receive_packets(struct xsk_socket_info *xsk)
