@@ -386,7 +386,7 @@ void log_hostname_to_file(const char *hostname)
 //     freeaddrinfo(res);
 // }
 
-void resolve_and_log_ip(const char *hostname)
+char *resolve_and_log_ip(const char *hostname)
 {
 	char ipstr[INET6_ADDRSTRLEN];
 
@@ -414,10 +414,10 @@ void resolve_and_log_ip(const char *hostname)
 	json_t *cached_ip = json_object_get(cache, hostname);
 	if (cached_ip)
 	{
-		const char *cached_ip_str = json_string_value(cached_ip);
+		const char *cached_ip_str = strdup(json_string_value(cached_ip));
 		printf("[Cache Hit] %s -> %s\n", hostname, cached_ip_str);
 		json_decref(cache);
-		return;
+		return cached_ip_str;
 	}
 
 	// Not in cache, resolve using getaddrinfo
@@ -429,7 +429,7 @@ void resolve_and_log_ip(const char *hostname)
 	if (status != 0)
 	{
 		json_decref(cache);
-		return; // DNS resolution failed
+		return NULL; // DNS resolution failed
 	}
 
 	for (struct addrinfo *p = res; p != NULL; p = p->ai_next)
@@ -468,6 +468,8 @@ void resolve_and_log_ip(const char *hostname)
 
 	freeaddrinfo(res);
 	json_decref(cache);
+	char *ret_ip = strdup(ipstr); // make a heap copy
+	return ret_ip;
 }
 
 uint16_t checksum(uint16_t *buf, int nwords)
@@ -522,6 +524,7 @@ static bool process_packet(struct xsk_socket_info *xsk,
 	// log_hostname_to_file(hostname);
 
 	struct ethhdr *eth = (struct ethhdr *)pkt;
+	char *ip_hostname;
 
 	if (ntohs(eth->h_proto) == ETH_P_IP)
 	{
@@ -535,7 +538,7 @@ static bool process_packet(struct xsk_socket_info *xsk,
 			char hostname[256];
 			parse_dns_query_name(dns_payload + 12, hostname);
 			log_hostname_to_file(hostname);
-			resolve_and_log_ip(hostname);
+			ip_hostname = resolve_and_log_ip(hostname);
 		}
 	}
 	else if (ntohs(eth->h_proto) == ETH_P_IPV6)
@@ -550,9 +553,11 @@ static bool process_packet(struct xsk_socket_info *xsk,
 			char hostname[256];
 			parse_dns_query_name(dns_payload + 12, hostname);
 			log_hostname_to_file(hostname);
-			resolve_and_log_ip(hostname);
+			ip_hostname = resolve_and_log_ip(hostname);
 		}
 	}
+
+	printf("Hostname: %s\n", ip_hostname);
 
 	/* Log the raw packet into a file */
 	FILE *log_file = fopen("packet_log.txt", "ab");
@@ -711,11 +716,22 @@ static bool process_packet(struct xsk_socket_info *xsk,
 			dns_reply[offset++] = 0x04;
 
 			// Random IPv4 address (e.g., 192.168.1.100)
-			dns_reply[offset++] = 123;
-			dns_reply[offset++] = 123;
-			dns_reply[offset++] = 123;
-			dns_reply[offset++] = 123;
-			
+			// dns_reply[offset++] = 123;
+			// dns_reply[offset++] = 123;
+			// dns_reply[offset++] = 123;
+			// dns_reply[offset++] = 123;
+			struct in_addr ip_addr;
+			if (inet_pton(AF_INET, ip_hostname, &ip_addr) == 1)
+			{
+				memcpy(&dns_reply[offset], &ip_addr, 4);
+				offset += 4;
+			}
+			else
+			{
+				fprintf(stderr, "Invalid IP address format: %s\n", ip_hostname);
+				return; // or handle the error appropriately
+			}
+
 			// Handle OPT (EDNS0) Additional Record if present
 			int opt_start = 12 + question_len + 16;			  // question + 16-byte answer
 			int opt_len = dns_payload_len - (opt_start - 12); // Remaining bytes in original payload
