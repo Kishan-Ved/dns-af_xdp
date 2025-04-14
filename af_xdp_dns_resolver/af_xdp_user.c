@@ -444,9 +444,8 @@ static struct dns_response *resolve_and_log_ip(const char *hostname, uint8_t *dn
 	*/
 
     // Send query
-    if (sendto(sock, dns_payload, dns_payload_len, 0, (struct sockaddr *)&resolver_addr, sizeof(resolver_addr)) < 0) {
+    if (sendto(sock, dns_payload, dns_payload_len, 0, (struct sockaddr *)resolver_addr, sizeof(*resolver_addr)) < 0) {
         fprintf(stderr, "Failed to send query: %s\n", strerror(errno));
-        close(sock);
         free(result);
         json_decref(cache);
         return NULL;
@@ -462,8 +461,6 @@ static struct dns_response *resolve_and_log_ip(const char *hostname, uint8_t *dn
         json_decref(cache);
         return NULL;
     }
-
-    close(sock);
 
     // Copy response to result
     memcpy(result->payload, response, response_len);
@@ -976,6 +973,7 @@ int main(int argc, char **argv)
 	/* Cleanup */
 	xsk_socket__delete(xsk_socket->xsk);
 	xsk_umem__delete(umem->umem);
+	close(sock);
 
 	return EXIT_OK;
 }
