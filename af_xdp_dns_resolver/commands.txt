@@ -1,0 +1,26 @@
+Host (inet6 fc00:dead:cafe:1::1, inet 10.11.1.1)
+
+make
+eval $(../testenv/testenv.sh alias)
+
+t setup --name veth
+t setup --name veth --legacy-ip
+
+sudo ./af_xdp_user -d veth --filename dns_filter_kern.o --progname xdp_dns_filter_func
+
+
+Virt (inet6 fc00:dead:cafe:1::2, inet 10.11.1.2)
+
+eval $(../testenv/testenv.sh alias)
+t status
+t ping
+t enter
+
+sudo tcpdump -i veth0 -w cap.pcap 
+tcpreplay --intf1 veth0 cap.pcap
+
+dnsperf -s fc00:dead:cafe:1::1 -d queries.txt
+dnsperf -s 10.11.1.1 -d queries.txt
+
+dig @fc00:dead:cafe:1::1 www.iitgn.ac.in
+dig @10.11.1.1 www.iitgn.ac.in
