@@ -1,0 +1,6 @@
+[submodule "af_xdp_dns_resolver/xdp-tools"]
+	path = af_xdp_dns_resolver/xdp-tools
+	url = https://github.com/xdp-project/xdp-tools/
+[submodule "af_xdp_dns_resolver/libbpf"]
+	path = af_xdp_dns_resolver/libbpf
+	url = https://github.com/libbpf/libbpf/
