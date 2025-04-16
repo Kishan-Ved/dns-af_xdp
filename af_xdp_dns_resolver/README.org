@@ -167,10 +167,19 @@ If there is a missing dependency it should output some error, if not we can cont
 
 Now run make to generate all the necessary files:
 
+(This is for Ubuntu distributions, use equivalent commands for other distributions.)
 #+begin_example
-make
+sudo apt install libjansson-dev
 #+end_example
 
 #+begin_example
-sudo apt install libjansson-dev
+make clean
+make
+#+end_example
+
+Now, navigate to the src directory and run:
+
+#+begin_example
+make clean
+make
 #+end_example
