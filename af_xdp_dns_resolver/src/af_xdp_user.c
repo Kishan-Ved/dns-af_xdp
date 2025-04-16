@@ -392,40 +392,52 @@ static void parse_dns_query_name(uint8_t *dns_payload, char *hostname)
 static struct dns_response *resolve_and_log_ip(const char *hostname, uint8_t *dns_payload, int dns_payload_len, int sock, struct sockaddr_in *resolver_addr)
 {
     struct dns_response *result = malloc(sizeof(struct dns_response));
-    if (!result)
-    {
-        fprintf(stderr, "Failed to allocate dns_response\n");
-        return NULL;
-    }
-    memset(result, 0, sizeof(struct dns_response));
+	if (!result) {
+		fprintf(stderr, "Failed to allocate dns_response\n");
+		return NULL;
+	}
+	memset(result, 0, sizeof(struct dns_response));
 
-    // Load existing cache
-    json_t *cache;
-    json_error_t error;
+	// Load existing cache
+	json_t *cache;
+	json_error_t error;
 
-    FILE *cache_fp = fopen("dns_bin_map.json", "r");
-    if (cache_fp)
-    {
-        cache = json_loadf(cache_fp, 0, &error);
-        fclose(cache_fp);
-    }
-    else
-    {
-        cache = json_object();
-    }
+	FILE *cache_fp = fopen("dns_mappings.json", "r");
+	if (cache_fp) {
+		cache = json_loadf(cache_fp, 0, &error);
+		fclose(cache_fp);
+	} else {
+		cache = json_object();
+	}
 
-    if (!cache || !json_is_object(cache))
-    {
-        cache = json_object();
-    }
+	if (!cache || !json_is_object(cache)) {
+		cache = json_object();
+	}
 
-    // Check cache
-    json_t *cached_bin_path = json_object_get(cache, hostname);
-    if (cached_bin_path)
-    {
-        const char *cached_bin_filepath = json_string_value(cached_bin_path);
-        printf("[Cache Hit] %s\n", hostname);
+	// ✅ Check number of entries and remove the first (oldest) if too many
+	if (json_object_size(cache) >= 1024) {
+		const char *key_to_remove = NULL;
+		void *iter = json_object_iter(cache);
+		if (iter) {
+			key_to_remove = json_object_iter_key(iter);
+			json_object_del(cache, key_to_remove);
+		}
+
+	}
+
+	// ✅ Check cache for existing binary
+	json_t *cached_bin_path = json_object_get(cache, hostname);
+	if (cached_bin_path) {
+		const char *cached_bin_filepath = json_string_value(cached_bin_path);
+		printf("[Cache Hit] %s\n", hostname);
+
 		FILE *bin_fp = fopen(cached_bin_filepath, "rb");
+		if (!bin_fp) {
+			fprintf(stderr, "Failed to open cached file: %s\n", cached_bin_filepath);
+			json_decref(cache);
+			free(result);
+			return NULL;
+		}
 
 		fseek(bin_fp, 0, SEEK_END);
 		size_t file_size = ftell(bin_fp);
@@ -435,73 +447,62 @@ static struct dns_response *resolve_and_log_ip(const char *hostname, uint8_t *dn
 		fread(result->payload, 1, file_size, bin_fp);
 		fclose(bin_fp);
 		json_decref(cache);
-		return result;	
-    }
+		return result;
+	}
 
-    /*
+	/*
 	MAIN CRUX - CREATE A UDP SOCKET AND SEND A DNS QUERY
 	RECEIVE THE RESPONSE BACK AND LOG INTO CACHE
 	*/
 
-    // Send query
-    if (sendto(sock, dns_payload, dns_payload_len, 0, (struct sockaddr *)resolver_addr, sizeof(*resolver_addr)) < 0) {
-        fprintf(stderr, "Failed to send query: %s\n", strerror(errno));
-        free(result);
-        json_decref(cache);
-        return NULL;
-    }
-
-    // Receive response
-    uint8_t response[MAX_DNS_PACKET];
-    ssize_t response_len = recvfrom(sock, response, MAX_DNS_PACKET, 0, NULL, NULL);
-    if (response_len < 0) {
-        fprintf(stderr, "Failed to receive response: %s\n", strerror(errno));
-        close(sock);
-        free(result);
-        json_decref(cache);
-        return NULL;
-    }
-
-    // Copy response to result
-    memcpy(result->payload, response, response_len);
-    result->len = response_len;
-
-	// Link the cached response's binary filename to the hostname in a separate JSON
-	json_t *bin_map;
-	FILE *bin_map_fp = fopen("dns_bin_map.json", "r");
-	if (bin_map_fp) {
-		bin_map = json_loadf(bin_map_fp, 0, &error);
-		fclose(bin_map_fp);
-	} else {
-		bin_map = json_object();
+	// Send query
+	if (sendto(sock, dns_payload, dns_payload_len, 0, (struct sockaddr *)resolver_addr, sizeof(*resolver_addr)) < 0) {
+		fprintf(stderr, "Failed to send query: %s\n", strerror(errno));
+		free(result);
+		json_decref(cache);
+		return NULL;
 	}
 
-	if (!bin_map || !json_is_object(bin_map)) {
-		bin_map = json_object();
+	// Receive response
+	uint8_t response[MAX_DNS_PACKET];
+	ssize_t response_len = recvfrom(sock, response, MAX_DNS_PACKET, 0, NULL, NULL);
+	if (response_len < 0) {
+		fprintf(stderr, "Failed to receive response: %s\n", strerror(errno));
+		close(sock);
+		free(result);
+		json_decref(cache);
+		return NULL;
 	}
 
+	// Copy response to result
+	memcpy(result->payload, response, response_len);
+	result->len = response_len;
+
+	// ✅ Link the cached response's binary filename to the hostname in a separate JSON
 	// Generate a unique filename for the binary response
 	char bin_filename[256];
 	snprintf(bin_filename, sizeof(bin_filename), "./payloadCache/response_%s.bin", hostname);
+
 	FILE *bin_fp = fopen(bin_filename, "wb");
 	if (bin_fp) {
 		fwrite(response, 1, response_len, bin_fp);
 		fclose(bin_fp);
 	}
-	// Add the mapping to the JSON object
-	json_object_set_new(bin_map, hostname, json_string(bin_filename));
 
-	// Save the updated JSON object to the file
-	bin_map_fp = fopen("dns_bin_map.json", "w");
-	if (bin_map_fp) {
-		json_dumpf(bin_map, bin_map_fp, JSON_INDENT(2));
-		fclose(bin_map_fp);
+	// Add the mapping to the cache JSON
+	json_object_set_new(cache, hostname, json_string(bin_filename));
+
+	// ✅ Save updated cache to file
+	FILE *save_fp = fopen("dns_mappings.json", "w");
+	if (save_fp) {
+		json_dumpf(cache, save_fp, JSON_INDENT(2));
+		fclose(save_fp);
 	}
+	json_decref(cache);
 
-	json_decref(bin_map);
+	printf("[Resolved] %s\n", hostname);
+	return result;
 
-    printf("[Resolved] %s\n", hostname);
-    return result;
 }
 
 static bool process_packet(struct xsk_socket_info *xsk, uint64_t addr, uint32_t len, int sock, struct sockaddr_in *resolver_addr)
