@@ -1,2 +1,3 @@
 .vscode
 **/*.bin
+af_xdp_dns_resolver/src/dns_bin_map.json
