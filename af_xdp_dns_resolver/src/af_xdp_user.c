@@ -414,7 +414,6 @@ static struct dns_response *resolve_and_log_ip(const char *hostname, uint8_t *dn
 		cache = json_object();
 	}
 
-	// ✅ Check number of entries and remove the first (oldest) if too many
 	if (json_object_size(cache) >= 1024) {
 		const char *key_to_remove = NULL;
 		void *iter = json_object_iter(cache);
@@ -425,7 +424,6 @@ static struct dns_response *resolve_and_log_ip(const char *hostname, uint8_t *dn
 
 	}
 
-	// ✅ Check cache for existing binary
 	json_t *cached_bin_path = json_object_get(cache, hostname);
 	if (cached_bin_path) {
 		const char *cached_bin_filepath = json_string_value(cached_bin_path);
@@ -478,7 +476,6 @@ static struct dns_response *resolve_and_log_ip(const char *hostname, uint8_t *dn
 	memcpy(result->payload, response, response_len);
 	result->len = response_len;
 
-	// ✅ Link the cached response's binary filename to the hostname in a separate JSON
 	// Generate a unique filename for the binary response
 	char bin_filename[256];
 	snprintf(bin_filename, sizeof(bin_filename), "./payloadCache/response_%s.bin", hostname);
@@ -492,7 +489,6 @@ static struct dns_response *resolve_and_log_ip(const char *hostname, uint8_t *dn
 	// Add the mapping to the cache JSON
 	json_object_set_new(cache, hostname, json_string(bin_filename));
 
-	// ✅ Save updated cache to file
 	FILE *save_fp = fopen("dns_mappings.json", "w");
 	if (save_fp) {
 		json_dumpf(cache, save_fp, JSON_INDENT(2));
