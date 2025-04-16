@@ -17,19 +17,19 @@ dependencies, and give you some pointers.
 
 On a machine running the Fedora Linux distribution, install the packages:
 
-#+begin_example
+#+begin_src sh
 sudo dnf install clang llvm
 sudo dnf install elfutils-libelf-devel libpcap-devel perf glibc-devel.i686
-#+end_example
+#+end_src
 
 Note also that Fedora by default sets a limit on the amount of locked memory
 the kernel will allow, which can interfere with loading BPF maps. The
 =testenv.sh= script will adjust this for you, but if you're not using that
 you will probably run into problems. Use this command to raise the limit:
 
-#+begin_example
+#+begin_src sh
   # ulimit -l 1024
-#+end_example
+#+end_src
 
 Note that you need to do this in the shell you are using to load programs
 (in particular, it won't work with =sudo=).
@@ -38,28 +38,28 @@ Note that you need to do this in the shell you are using to load programs
 
 On Debian and Ubuntu installations, install the dependencies like this:
 
-#+begin_example
+#+begin_src sh
 sudo apt install clang llvm libelf-dev libpcap-dev build-essential libc6-dev-i386 m4
-#+end_example
+#+end_src
 
 To install the 'perf' utility, run this on Debian:
-#+begin_example
+#+begin_src sh
 sudo apt install linux-perf
-#+end_example
+#+end_src
 
 or this on Ubuntu:
 
-#+begin_example
+#+begin_src sh
 sudo apt install linux-tools-$(uname -r)
-#+end_example
+#+end_src
 
 ** Packages on openSUSE
 
 On a machine running the openSUSE distribution, install the packages:
 
-#+begin_example
+#+begin_src sh
 sudo zypper install clang llvm libelf-devel libpcap-devel perf linux-glibc-devel
-#+end_example
+#+end_src
 
 * Kernel headers dependency
 
@@ -80,25 +80,25 @@ distro. We may choose to shadow some of these later.
 ** Packages on Fedora
 
 On a machine running the Fedora Linux distribution, install the package:
-#+begin_example
+#+begin_src sh
 sudo dnf install kernel-headers
-#+end_example
+#+end_src
 
 ** Packages on Debian/Ubuntu
 
 On Debian and Ubuntu installations, install the headers like this
 
-#+begin_example
+#+begin_src sh
 sudo apt install linux-headers-$(uname -r)
-#+end_example
+#+end_src
 
 ** Packages on openSUSE
 
 On a machine running the openSUSE distribution, install the package:
 
-#+begin_example
+#+begin_src sh
 sudo zypper install kernel-devel
-#+end_example
+#+end_src
 
 
 * Extra tools
@@ -115,19 +115,19 @@ should also install tcpdump.
 
 On a machine running the Fedora Linux distribution, install package:
 
-#+begin_example
+#+begin_src sh
 sudo dnf install bpftool
 sudo dnf install tcpdump
-#+end_example
+#+end_src
 
 ** Packages on Ubuntu
 
 Starting from Ubuntu 19.10, bpftool can be installed with:
 
-#+begin_example
+#+begin_src sh
 sudo apt install linux-tools-common linux-tools-generic
 sudo apt install tcpdump
-#+end_example
+#+end_src
 
 (Ubuntu 18.04 LTS also has it, but it is an old and quite limited bpftool
 version.)
@@ -136,10 +136,10 @@ version.)
 
 Starting from Debian Bullseye, bpftool can be installed with:
 
-#+begin_example
+#+begin_src sh
 sudo apt install bpftool
 sudo apt install tcpdump
-#+end_example
+#+end_src
 
 (If you are on Debian Buster, you can get it from [[https://backports.debian.org][buster-backports]].)
 
@@ -147,10 +147,10 @@ sudo apt install tcpdump
 
 On a machine running the openSUSE Tumbleweed distribution, install package:
 
-#+begin_example
+#+begin_src sh
 sudo zypper install bpftool
 sudo zypper install tcpdump
-#+end_example
+#+end_src
 
 
 * Generate the necessary files
@@ -159,27 +159,97 @@ Once you have installed the dependencies you need genereate the necessary files 
 
 Start by running ./configure from the root of the repository to make sure every dependency is installed.
 
-#+begin_example
+#+begin_src sh
 ./configure
-#+end_example
+#+end_src
 
 If there is a missing dependency it should output some error, if not we can continue.
 
 Now run make to generate all the necessary files:
 
 (This is for Ubuntu distributions, use equivalent commands for other distributions.)
-#+begin_example
+#+begin_src sh
 sudo apt install libjansson-dev
-#+end_example
+#+end_src
 
-#+begin_example
+#+begin_src sh
 make clean
 make
-#+end_example
+#+end_src
 
 Now, navigate to the src directory and run:
 
-#+begin_example
+#+begin_src sh
 make clean
 make
-#+end_example
+#+end_src
+
+
+* Running the DNS Filter with AF_XDP
+
+This setup involves using a virtual environment to run a DNS filter program with AF_XDP and run DNS queries.
+
+** Host Setup (IP: inet6 `fc00:dead:cafe:1::1`, inet `10.11.1.1`)
+
+1. Build the project:
+   #+begin_src sh
+   make
+   #+end_src
+
+2. Initialize the test environment aliases on host:
+   #+begin_src sh
+   eval $(../testenv/testenv.sh alias)
+   #+end_src
+
+3. Setup the `veth` interface:
+   #+begin_src sh
+   t setup --name veth # for IPv6
+   t setup --name veth --legacy-ip # for IPv4
+   #+end_src
+
+4. Run the AF_XDP program on veth interface:
+   #+begin_src sh
+   sudo ./af_xdp_user -d veth --filename dns_filter_kern.o --progname xdp_dns_filter_func 
+   #+end_src
+
+** Virtual Host Setup (on another terminal) (IP: inet6 `fc00:dead:cafe:1::2`, inet `10.11.1.2`)
+
+1. Initialize test environment alias for Virtual Host:
+   #+begin_src sh
+   eval $(../testenv/testenv.sh alias)
+   #+end_src
+
+2. Enter the Virtual Host environment:
+   #+begin_src sh
+   t enter
+   #+end_src
+
+3. Check environment status:
+   #+begin_src sh
+   t status
+   t ping
+   #+end_src
+
+** DNS Query Testing
+
+1. For capturing traffic on `veth0` Virtual Host:
+   #+begin_src sh
+   sudo tcpdump -i veth0 -w cap.pcap 
+   #+end_src
+
+2. Replay traffic captured in pcap file on `veth0` Virtual Host:
+   #+begin_src sh
+   tcpreplay --intf1 veth0 cap.pcap
+   #+end_src
+
+3. Run DNS performance tests:
+   #+begin_src sh
+   dnsperf -s fc00:dead:cafe:1::1 -d queries.txt # for IPv6 setup
+   dnsperf -s 10.11.1.1 -d queries.txt # for IPv4 setup
+   #+end_src
+
+4. Send manual DNS queries using `dig` from `veth0` Virtual Host:
+   #+begin_src sh
+   dig @fc00:dead:cafe:1::1 www.iitgn.ac.in # for IPv6 setup
+   dig @10.11.1.1 www.iitgn.ac.in # for IPv4 setup
+   #+end_src
