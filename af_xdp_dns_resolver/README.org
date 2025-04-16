@@ -183,3 +183,73 @@ Now, navigate to the src directory and run:
 make clean
 make
 #+end_example
+
+
+* Running the DNS Filter with AF_XDP
+
+This setup involves using a virtual environment to run a DNS filter program with AF_XDP and run DNS queries.
+
+** Host Setup (IP: inet6 `fc00:dead:cafe:1::1`, inet `10.11.1.1`)
+
+1. Build the project:
+   #+begin_src sh
+   make
+   #+end_src
+
+2. Initialize the test environment aliases on host:
+   #+begin_src sh
+   eval $(../testenv/testenv.sh alias)
+   #+end_src
+
+3. Setup the `veth` interface:
+   #+begin_src sh
+   t setup --name veth # for IPv6
+   t setup --name veth --legacy-ip # for IPv4
+   #+end_src
+
+4. Run the AF_XDP program on veth interface:
+   #+begin_src sh
+   sudo ./af_xdp_user -d veth --filename dns_filter_kern.o --progname xdp_dns_filter_func 
+   #+end_src
+
+** Virtual Host Setup (on another terminal) (IP: inet6 `fc00:dead:cafe:1::2`, inet `10.11.1.2`)
+
+1. Initialize test environment alias for Virtual Host:
+   #+begin_src sh
+   eval $(../testenv/testenv.sh alias)
+   #+end_src
+
+2. Enter the Virtual Host environment:
+   #+begin_src sh
+   t enter
+   #+end_src
+
+3. Check environment status:
+   #+begin_src sh
+   t status
+   t ping
+   #+end_src
+
+** DNS Query Testing
+
+1. For capturing traffic on `veth0` Virtual Host:
+   #+begin_src sh
+   sudo tcpdump -i veth0 -w cap.pcap 
+   #+end_src
+
+2. Replay traffic captured in pcap file on `veth0` Virtual Host:
+   #+begin_src sh
+   tcpreplay --intf1 veth0 cap.pcap
+   #+end_src
+
+3. Run DNS performance tests:
+   #+begin_src sh
+   dnsperf -s fc00:dead:cafe:1::1 -d queries.txt # for IPv6 setup
+   dnsperf -s 10.11.1.1 -d queries.txt # for IPv4 setup
+   #+end_src
+
+4. Send manual DNS queries using `dig` from `veth0` Virtual Host:
+   #+begin_src sh
+   dig @fc00:dead:cafe:1::1 www.iitgn.ac.in # for IPv6 setup
+   dig @10.11.1.1 www.iitgn.ac.in # for IPv4 setup
+   #+end_src
